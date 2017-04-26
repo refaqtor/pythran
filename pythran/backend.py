@@ -732,131 +732,6 @@ pythonic::types::none_type>::type result_type;
                    Block([loop_body_prelude, loop_body]))
         return [self.process_omp_attachements(node, loop)]
 
-    def handle_real_loop_comparison(self, args, stmts, target, upper_bound,
-                                    step):
-        """
-        Handle comparison for real loops.
-
-        Add the correct comparison operator if possible or set a runtime __cmp
-        comparison.
-        """
-        # order is 1 for increasing loop, -1 for decreasing loop and 0 if it is
-        # not known at compile time
-        if len(args) <= 2:
-            order = 1
-        elif isinstance(args[2], ast.Num):
-            order = -1 + 2 * (int(args[2].n) > 0)
-        elif isinstance(args[1], ast.Num) and isinstance(args[0], ast.Num):
-            order = -1 + 2 * (int(args[1].n) > int(args[0].n))
-        else:
-            order = 0
-
-        if order:
-            comparison = "{} < {}" if order == 1 else "{} > {}"
-            comparison = comparison.format(target, upper_bound)
-            for_pos = 0
-        else:
-            cmp_type = "std::function<bool(long, long)> "
-            cmp_op = "__cmp{}".format(len(self.break_handlers))
-
-            # For yield function, all variables are globals.
-            if self.yields:
-                self.extra_declarations.append((cmp_op, cmp_type))
-                cmp_type = ""
-
-            stmts.insert(0, Statement("{} {} = std::less<long>()".format(
-                cmp_type, cmp_op)))
-            stmts.insert(1, If("{} < 0L".format(step),
-                               Statement("{} = std::greater<long>()".format(
-                                   cmp_op))))
-            for_pos = 2
-            comparison = "{0}({1}, {2})".format(cmp_op, target, upper_bound)
-        return comparison, for_pos
-
-    def gen_c_for(self, node, local_iter, loop_body):
-        """
-        Create C For representation for Cxx generation.
-
-        Examples
-        --------
-        >> for i in xrange(10):
-        >>     ... do things ...
-
-        Becomes
-
-        >> for(long i = 0, __targetX = 10; i < __targetX; i += 1)
-        >>     ... do things ...
-
-        Or
-
-        >> for i in xrange(10, 0, -1):
-        >>     ... do things ...
-
-        Becomes
-
-        >> for(long i = 10, __targetX = 0; i > __targetX; i += -1)
-        >>     ... do things ...
-
-        Or
-
-        >> for i in xrange(a, b, c):
-        >>     ... do things ...
-
-        Becomes
-
-        >> std::function<bool(int, int)> __cmpX = std::less<long>();
-        >> if(c < 0)
-        >>     __cmpX = std::greater<long>();
-        >> for(long i = a, __targetX = b; __cmpX(i, __targetX); i += c)
-        >>     ... do things ...
-
-        It the case of not local variable, typing for `i` disappear
-        """
-        args = node.iter.args
-        step = "1L" if len(args) <= 2 else self.visit(args[2])
-        if len(args) == 1:
-            lower_bound = "0L"
-            upper_value = self.visit(args[0])
-        else:
-            lower_bound = self.visit(args[0])
-            upper_value = self.visit(args[1])
-
-        upper_bound = "__target{0}".format(len(self.break_handlers))
-
-        upper_type = iter_type = "long "
-
-        # If variable is local to the for body keep it local...
-        if node.target.id in self.scope[node] and not self.yields:
-            self.ldecls = {d for d in self.ldecls if d.id != node.target.id}
-            loop = list()
-        else:
-            # For yield function, upper_bound is globals.
-            if self.yields:
-                self.extra_declarations.append((upper_bound, upper_type))
-                upper_type = ""
-            iter_type = ""
-            # Back one step to keep Python behavior (except for break)
-            loop = [If("{} == {}".format(local_iter, upper_bound),
-                    Statement("{} -= {}".format(local_iter, step)))]
-
-        comparison, for_pos = self.handle_real_loop_comparison(args, loop,
-                                                               local_iter,
-                                                               upper_bound,
-                                                               step)
-
-        forloop = For("{0} {1} = {2}".format(iter_type, local_iter,
-                                             lower_bound),
-                      comparison,
-                      "{0} += {1}".format(local_iter, step),
-                      loop_body)
-
-        loop.insert(for_pos, self.process_omp_attachements(node, forloop))
-
-        # Store upper bound value
-        header = [Statement("{0} {1} = {2}".format(upper_type, upper_bound,
-                                                   upper_value))]
-        return header, loop
-
     def handle_omp_for(self, node, local_iter):
         """
         Fix OpenMP directives on For loops.
@@ -905,39 +780,6 @@ pythonic::types::none_type>::type result_type;
         auto_for &= not metadata.get(node, OMPDirective)
         return auto_for
 
-    def can_use_c_for(self, node):
-        """
-        Check if a for loop can use classic C syntax.
-
-        To use C syntax:
-            - target should not be assign in the loop
-            - xrange should be use as iterator
-            - order have to be known at compile time or OpenMP should not be
-              use
-
-        """
-        assert isinstance(node.target, ast.Name)
-        pattern = ast.Call(func=ast.Attribute(value=ast.Name(id='__builtin__',
-                                                             ctx=ast.Load(),
-                                                             annotation=None),
-                                              attr='xrange', ctx=ast.Load()),
-                           args=AST_any(), keywords=[])
-        is_assigned = {node.target.id: False}
-        [is_assigned.update(self.passmanager.gather(IsAssigned, stmt))
-         for stmt in node.body]
-
-        if (node.iter not in ASTMatcher(pattern).search(node.iter) or
-                is_assigned[node.target.id]):
-            return False
-
-        args = node.iter.args
-        if (len(args) > 2 and (not isinstance(args[2], ast.Num) and
-                               not (isinstance(args[1], ast.Num) and
-                                    isinstance(args[0], ast.Num))) and
-                metadata.get(node, OMPDirective)):
-            return False
-        return True
-
     @cxx_loop
     def visit_For(self, node):
         """
@@ -977,36 +819,32 @@ pythonic::types::none_type>::type result_type;
         loop_body = self.process_locals(node, loop_body, node.target.id)
         iterable = self.visit(node.iter)
 
-        if self.can_use_c_for(node):
-            header, loop = self.gen_c_for(node, target, loop_body)
+        if self.can_use_autofor(node):
+            header = []
+            self.ldecls = {d for d in self.ldecls
+                           if d.id != node.target.id}
+            autofor = AutoFor(target, iterable, loop_body)
+            loop = [self.process_omp_attachements(node, autofor)]
         else:
+            # Iterator declaration
+            local_iter = "__iter{0}".format(len(self.break_handlers))
+            local_iter_decl = Assignable(DeclType(iterable))
 
-            if self.can_use_autofor(node):
-                header = []
-                self.ldecls = {d for d in self.ldecls
-                               if d.id != node.target.id}
-                autofor = AutoFor(target, iterable, loop_body)
-                loop = [self.process_omp_attachements(node, autofor)]
-            else:
-                # Iterator declaration
-                local_iter = "__iter{0}".format(len(self.break_handlers))
-                local_iter_decl = Assignable(DeclType(iterable))
+            self.handle_omp_for(node, local_iter)
 
-                self.handle_omp_for(node, local_iter)
+            # For yield function, iterable is globals.
+            if self.yields:
+                self.extra_declarations.append(
+                    (local_iter, local_iter_decl,))
+                local_iter_decl = ""
 
-                # For yield function, iterable is globals.
-                if self.yields:
-                    self.extra_declarations.append(
-                        (local_iter, local_iter_decl,))
-                    local_iter_decl = ""
-
-                # Assign iterable
-                # For C loop, it avoids issues
-                # if the upper bound is assigned in the loop
-                header = [Statement("{0} {1} = {2}".format(local_iter_decl,
-                                                           local_iter,
-                                                           iterable))]
-                loop = self.gen_for(node, target, local_iter, loop_body)
+            # Assign iterable
+            # For C loop, it avoids issues
+            # if the upper bound is assigned in the loop
+            header = [Statement("{0} {1} = {2}".format(local_iter_decl,
+                                                       local_iter,
+                                                       iterable))]
+            loop = self.gen_for(node, target, local_iter, loop_body)
 
         # For xxxComprehension, it is replaced by a for loop. In this case,
         # pre-allocate size of container.
